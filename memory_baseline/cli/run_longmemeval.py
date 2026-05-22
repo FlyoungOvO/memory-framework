@@ -6,6 +6,7 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 from memory_baseline.cli.judge_longmemeval import _eval_row, _metrics
@@ -13,6 +14,12 @@ from memory_baseline.core.env import load_project_env
 from memory_baseline.generation.answerer import answer_focus_for_question_type, make_answerer
 from memory_baseline.generation.evidence_compiler import make_evidence_compiler
 from memory_baseline.generation.judge import make_judge
+from memory_baseline.generation.provence_pruner import (
+    DEFAULT_PROVENCE_MODEL,
+    ProvenceEvidencePruner,
+    ProvencePruningResult,
+    make_provence_pruner,
+)
 from memory_baseline.indexing.embedder import embed_texts_cached, make_embedder
 from memory_baseline.evaluation.error_analysis import write_error_analysis
 from memory_baseline.evaluation.retrieval import aggregate_retrieval_results
@@ -20,6 +27,7 @@ from memory_baseline.core.io import read_predictions, write_predictions
 from memory_baseline.data.longmemeval import load_question_ids, load_samples, parse_question_types
 from memory_baseline.retrieval.dense import DenseRetriever, _dedupe_and_sort_windows
 from memory_baseline.retrieval.formatter import format_evidence_for_answerer
+from memory_baseline.retrieval.typed_facts import prepend_typed_fact_pack
 from memory_baseline.core.schemas import LongMemEvalSample
 from memory_baseline.core.token_accounting import (
     add_build_time,
@@ -45,7 +53,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--message-range", type=int, default=2)
     parser.add_argument("--chunk-mode", choices=["turn"], default="turn")
     parser.add_argument("--embedding-text-mode", choices=["metadata_content", "content"], default="content")
-    parser.add_argument("--retrieval-method", choices=["dense", "hybrid"], default="dense")
+    parser.add_argument("--retrieval-method", choices=["dense", "hybrid", "semantic_bm25_boost"], default="dense")
     parser.add_argument("--temporal-boost", type=float, default=0.0)
     parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL") or os.getenv("EMBEDDER_MODEL") or "local-hash")
     parser.add_argument("--embedding-base-url", default=os.getenv("EMBEDDING_BASE_URL") or os.getenv("EMBEDDER_BASE_URL"))
@@ -68,6 +76,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--max-evidence-tokens", type=int)
+    parser.add_argument("--disable-evidence-compiler", action="store_true")
+    parser.add_argument("--provence-pruning", action="store_true")
+    parser.add_argument("--provence-model", default=DEFAULT_PROVENCE_MODEL)
+    parser.add_argument("--provence-threshold", type=float, default=0.1)
+    parser.add_argument("--provence-batch-size", type=int, default=32)
+    parser.add_argument("--typed-sidecar", action="store_true")
     parser.add_argument("--output-dir", default="runs")
     return parser.parse_args(argv)
 
@@ -232,6 +246,7 @@ def run_build_stage(args: argparse.Namespace, run_dir: Path, samples: list[LongM
                 skip_existing=skip_existing,
                 chunk_mode=args.chunk_mode,
                 embedding_text_mode=args.embedding_text_mode,
+                typed_sidecar=args.typed_sidecar,
             )
         )
     write_jsonl(run_dir / "build_stats.jsonl", stats)
@@ -259,6 +274,7 @@ def run_retrieve_stage(args: argparse.Namespace, run_dir: Path, samples: list[Lo
                 temporal_boost=args.temporal_boost,
                 query_vector=query_batch.vectors[row],
                 query_embedding_tokens=query_tokens[row],
+                typed_sidecar=args.typed_sidecar,
             )
         )
     write_jsonl(run_dir / "retrieval_results.jsonl", results)
@@ -269,7 +285,12 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
     retrieval_results = read_jsonl(run_dir / "retrieval_results.jsonl")
     retrieval_by_id = {result["question_id"]: result for result in retrieval_results}
     answerer = make_answerer(args.answer_model, args.answer_base_url)
-    compiler = make_evidence_compiler(args.answer_model, args.answer_base_url)
+    compiler = None if args.disable_evidence_compiler else make_evidence_compiler(args.answer_model, args.answer_base_url)
+    workers = args.answer_parallelism if args.answer_parallelism is not None else args.parallelism
+    pruners = _make_provence_pruners(args, max(1, workers)) if args.provence_pruning else None
+    pruner_queue = Queue()
+    for pruner in pruners or []:
+        pruner_queue.put(pruner)
     skip_existing = args.skip_existing or args.resume
     existing_predictions = read_predictions(run_dir / "predictions.jsonl") if skip_existing else {}
     existing_logs = {
@@ -292,14 +313,25 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
                 log,
             )
         result = retrieval_by_id[sample.question_id]
-        formatted = _formatted_evidence_for_answer(result, sample, args.max_evidence_tokens)
+        pruner = pruner_queue.get() if pruner_queue.qsize() else None
+        try:
+            formatted = _formatted_evidence_for_answer(
+                result,
+                sample,
+                args.max_evidence_tokens,
+                pruner,
+            )
+        finally:
+            if pruner is not None:
+                pruner_queue.put(pruner)
         compiled = None
         evidence_text = formatted["text"]
-        if sample.question_type in {"knowledge-update", "temporal-reasoning"}:
+        if compiler is not None and sample.question_type in {"knowledge-update", "temporal-reasoning"}:
             compiled = compiler.compile(sample.question_date, formatted["text"], sample.question, sample.question_type)
             evidence_text = compiled.text
         answer = answerer.answer(sample.question_date, evidence_text, sample.question, sample.question_type)
         evidence_ids = formatted["included_turn_ids"]
+        pruning = formatted["pruning"]
         compiler_input_tokens = compiled.prompt_tokens if compiled is not None else 0
         compiler_output_tokens = compiled.completion_tokens if compiled is not None else 0
         compiler_total_tokens = compiled.total_tokens if compiled is not None else 0
@@ -309,17 +341,27 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
             "question_id": sample.question_id,
             "question_type": sample.question_type,
             "model": answer.model,
-            "latency_seconds": (compiled.latency_seconds if compiled is not None else 0.0) + answer.latency_seconds,
+            "latency_seconds": pruning.latency_seconds + (compiled.latency_seconds if compiled is not None else 0.0) + answer.latency_seconds,
             "retrieval_latency_seconds": result.get("retrieval_latency_seconds", 0.0),
             "query_input_tokens": query_input_tokens,
             "query_output_tokens": query_output_tokens,
             "query_total_tokens": query_input_tokens + query_output_tokens,
+            "evidence_compiler_disabled": args.disable_evidence_compiler,
             "compiler_model": compiled.model if compiled is not None else None,
             "compiler_input_tokens": compiler_input_tokens,
             "compiler_output_tokens": compiler_output_tokens,
             "compiler_total_tokens": compiler_total_tokens,
             "compiler_provider_usage": compiled.provider_usage if compiled is not None else {},
             "compiled_evidence": compiled.text if compiled is not None else None,
+            "provence_pruning": args.provence_pruning,
+            "provence_model": args.provence_model if args.provence_pruning else None,
+            "provence_threshold": args.provence_threshold if args.provence_pruning else None,
+            "provence_input_tokens": pruning.input_tokens,
+            "provence_output_tokens": pruning.output_tokens,
+            "provence_source_turn_count": pruning.source_turn_count,
+            "provence_kept_turn_count": pruning.kept_turn_count,
+            "provence_compression_rate": pruning.compression_rate,
+            "provence_latency_seconds": pruning.latency_seconds,
             "answer_input_tokens": answer.prompt_tokens,
             "answer_output_tokens": answer.completion_tokens,
             "answer_total_tokens": answer.total_tokens,
@@ -329,9 +371,9 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
             "message_range": result.get("message_range"),
             "retrieval_method": result.get("retrieval_method"),
             "temporal_boost": result.get("temporal_boost"),
+            "typed_sidecar": result.get("typed_sidecar", False),
+            "typed_fact_count": len(result.get("typed_facts", [])),
             "evidence_truncated": formatted["truncated"],
-            "evidence_packing": "evidence_compiler" if compiled is not None else formatted["packing"],
-            "source_evidence_packing": formatted["packing"],
             "answer_focus": answer_focus_for_question_type(sample.question_type),
         }
         return {"question_id": sample.question_id, "hypothesis": answer.hypothesis}, log
@@ -342,7 +384,6 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
         for question_id, hypothesis in existing_predictions.items()
     ]
     logs: list[dict[str, Any]] = list(existing_logs.values())
-    workers = args.answer_parallelism if args.answer_parallelism is not None else args.parallelism
     if workers > 1:
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(answer_one, sample) for sample in pending_samples]
@@ -363,6 +404,16 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Long
         write_predictions(pred_path, predictions)
         write_jsonl(log_path, logs)
     return logs
+
+
+def _make_provence_pruners(args: argparse.Namespace, count: int) -> list[ProvenceEvidencePruner]:
+    pruners = [
+        make_provence_pruner(args.provence_model, args.provence_threshold, args.provence_batch_size)
+        for _ in range(count)
+    ]
+    for pruner in pruners:
+        pruner.model
+    return pruners
 
 
 def run_judge_stage(args: argparse.Namespace, run_dir: Path, samples: list[LongMemEvalSample]) -> list[dict[str, Any]]:
@@ -586,30 +637,31 @@ def _formatted_evidence_for_answer(
     result: dict[str, Any],
     sample: LongMemEvalSample,
     max_evidence_tokens: int | None,
+    pruner: ProvenceEvidencePruner | None = None,
 ) -> dict[str, Any]:
+    pruning = ProvencePruningResult([], 0, 0, 0, 0, 0.0, 0.0)
     if result.get("deduped_evidence"):
+        evidence_turns = result["deduped_evidence"]
+        if pruner is not None:
+            pruning = pruner.prune_turns(sample.question, evidence_turns)
+            evidence_turns = pruning.turns
         formatted = format_evidence_for_answerer(
-            result["deduped_evidence"],
+            evidence_turns,
             sample.question_date,
             max_evidence_tokens,
             question_type=sample.question_type,
         )
-        packing = None
-        if sample.question_type == "temporal-reasoning":
-            packing = "temporal_timeline"
-        elif sample.question_type == "multi-session":
-            packing = "count_and_list_check"
         return {
-            "text": formatted.text,
+            "text": prepend_typed_fact_pack(formatted.text, result.get("typed_facts", [])),
             "included_turn_ids": formatted.included_turn_ids,
             "truncated": formatted.truncated,
-            "packing": packing,
+            "pruning": pruning,
         }
     return {
-        "text": result["formatted_evidence"],
+        "text": result.get("typed_augmented_evidence") or result["formatted_evidence"],
         "included_turn_ids": result.get("formatted_evidence_turn_ids", []),
         "truncated": result.get("evidence_truncated", False),
-        "packing": None,
+        "pruning": pruning,
     }
 
 
@@ -716,6 +768,12 @@ def _config_dict(args: argparse.Namespace, samples: list[LongMemEvalSample]) -> 
         "cutoff_parallelism": args.cutoff_parallelism,
         "mode": args.mode,
         "max_evidence_tokens": args.max_evidence_tokens,
+        "disable_evidence_compiler": args.disable_evidence_compiler,
+        "provence_pruning": args.provence_pruning,
+        "provence_model": args.provence_model,
+        "provence_threshold": args.provence_threshold,
+        "provence_batch_size": args.provence_batch_size,
+        "typed_sidecar": args.typed_sidecar,
         "output_dir": args.output_dir,
         "num_selected_samples": len(samples),
         "selected_question_ids": [sample.question_id for sample in samples],

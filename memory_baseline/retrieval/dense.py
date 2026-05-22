@@ -14,6 +14,7 @@ from memory_baseline.core.schemas import LongMemEvalSample
 from memory_baseline.core.utils import estimate_tokens, id_key, timestamp_sort_key
 from memory_baseline.indexing.vector_store import QuestionStore
 from memory_baseline.retrieval.ranking import rank_indices
+from memory_baseline.retrieval.typed_facts import prepend_typed_fact_pack, select_typed_facts, should_use_typed_facts, source_turn_ids
 
 
 class DenseRetriever:
@@ -38,6 +39,7 @@ class DenseRetriever:
         temporal_boost: float = 0.0,
         query_vector: np.ndarray | None = None,
         query_embedding_tokens: int | None = None,
+        typed_sidecar: bool = False,
     ) -> dict[str, Any]:
         started = time.monotonic()
         if query_vector is None:
@@ -49,6 +51,7 @@ class DenseRetriever:
             query_tokens = int(query_embedding_tokens or 0)
         scores = self.store.embeddings @ query
         candidate_indices = _filter_indices(self.store.raw_turns, filters, sample.question_date)
+        ranking_diagnostics: dict[str, Any] = {}
         indices, ranked_scores, _bm25_scores = rank_indices(
             query=sample.question,
             dense_scores=scores,
@@ -61,6 +64,7 @@ class DenseRetriever:
             question_date=sample.question_date,
             temporal_boost=temporal_boost,
             store=self.store,
+            ranking_diagnostics=ranking_diagnostics,
         )
         matched_turns = []
         for rank, idx in enumerate(indices, start=1):
@@ -69,15 +73,25 @@ class DenseRetriever:
 
         evidence_windows = _expand_windows(self.store.raw_turns, matched_turns, message_range)
         deduped_evidence = _dedupe_and_sort_windows(evidence_windows)
+        typed_facts = []
+        if typed_sidecar and should_use_typed_facts(sample.question, sample.question_type):
+            evidence_ids = {str(turn.get("stable_turn_id")) for turn in deduped_evidence}
+            candidate_facts = [
+                fact
+                for fact in self.store.typed_facts
+                if evidence_ids & {str(source_id) for source_id in fact.get("source_turn_ids", [])}
+            ]
+            typed_facts = select_typed_facts(sample.question, candidate_facts)
         formatted = format_evidence_for_answerer(
             deduped_evidence,
             sample.question_date,
             max_evidence_tokens,
             question_type=sample.question_type,
         )
-        metrics = compute_retrieval_metrics(sample, matched_turns, deduped_evidence, formatted.token_count)
+        formatted_text = prepend_typed_fact_pack(formatted.text, typed_facts)
+        metrics = compute_retrieval_metrics(sample, matched_turns, deduped_evidence, estimate_tokens(formatted_text))
 
-        return {
+        result = {
             "question_id": sample.question_id,
             "question_type": sample.question_type,
             "question": sample.question,
@@ -97,6 +111,10 @@ class DenseRetriever:
             "evidence_windows": evidence_windows,
             "deduped_evidence": deduped_evidence,
             "formatted_evidence": formatted.text,
+            "typed_augmented_evidence": formatted_text,
+            "typed_sidecar": typed_sidecar,
+            "typed_facts": typed_facts,
+            "typed_fact_source_turn_ids": sorted(source_turn_ids(typed_facts)),
             "formatted_evidence_turn_ids": formatted.included_turn_ids,
             "evidence_truncated": formatted.truncated,
             "evidence_truncate_strategy": formatted.truncate_strategy,
@@ -104,6 +122,9 @@ class DenseRetriever:
             "retrieval_latency_seconds": time.monotonic() - started,
             "metrics": metrics,
         }
+        if ranking_diagnostics:
+            result["ranking_diagnostics"] = ranking_diagnostics
+        return result
 
 
 def _matched_turn(turn: dict[str, Any], score: float, rank: int) -> dict[str, Any]:
@@ -199,6 +220,32 @@ def _dedupe_and_sort_windows(evidence_windows: list[dict[str, Any]]) -> list[dic
             int(turn.get("turn_idx", 0)),
         ),
     )
+
+
+def _dedupe_and_sort_turns(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    deduped = []
+    for turn in turns:
+        turn_id = str(turn["stable_turn_id"])
+        if turn_id in seen:
+            continue
+        seen.add(turn_id)
+        deduped.append(dict(turn))
+    return sorted(
+        deduped,
+        key=lambda turn: (
+            timestamp_sort_key(turn.get("session_date")),
+            int(turn.get("session_idx", 0)),
+            int(turn.get("turn_idx", 0)),
+        ),
+    )
+
+
+def _source_turns_for_typed_facts(raw_turns: list[dict[str, Any]], typed_facts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    wanted = source_turn_ids(typed_facts)
+    if not wanted:
+        return []
+    return [dict(turn) for turn in raw_turns if str(turn.get("stable_turn_id")) in wanted]
 
 
 def compute_retrieval_metrics(

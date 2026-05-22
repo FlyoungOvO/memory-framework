@@ -12,6 +12,7 @@ from .embedder import BaseEmbedder, embed_texts_cached, l2_normalize
 from memory_baseline.data.longmemeval import flatten_sample, save_normalized_question
 from memory_baseline.core.schemas import LongMemEvalSample
 from memory_baseline.core.utils import ensure_dir, read_jsonl, safe_filename, write_json, write_jsonl
+from memory_baseline.retrieval.typed_facts import build_typed_facts
 
 
 def embedding_text_for_turn(turn: dict[str, Any], embedding_text_mode: str = "content") -> str:
@@ -60,6 +61,8 @@ class QuestionStore:
             for row, turn in zip(self.embedding_meta, self.raw_turns)
         ]
         self.lexical_texts = lexical_texts_for_turns(self.raw_turns, self.stats.get("chunk_mode", "turn"))
+        typed_facts_path = self.store_dir / "typed_facts.jsonl"
+        self.typed_facts = read_jsonl(typed_facts_path) if typed_facts_path.exists() else []
 
 
 def build_question_store(
@@ -71,6 +74,7 @@ def build_question_store(
     skip_existing: bool = False,
     chunk_mode: str = "turn",
     embedding_text_mode: str = "content",
+    typed_sidecar: bool = False,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     store_dir = question_store_dir(run_dir, sample.question_id)
@@ -81,12 +85,16 @@ def build_question_store(
 
             stats = json.loads(stats_path.read_text(encoding="utf-8"))
             _check_store_mode(stats, chunk_mode, embedding_text_mode, store_dir)
+            if typed_sidecar and not (store_dir / "typed_facts.jsonl").exists():
+                _write_typed_facts_for_store(store_dir, stats)
             return stats
         if stats_path.exists():
             import json
 
             stats = json.loads(stats_path.read_text(encoding="utf-8"))
             _check_store_mode(stats, chunk_mode, embedding_text_mode, store_dir)
+            if typed_sidecar and not (store_dir / "typed_facts.jsonl").exists():
+                _write_typed_facts_for_store(store_dir, stats)
             return stats
     if store_dir.exists() and force_rebuild:
         shutil.rmtree(store_dir)
@@ -112,11 +120,18 @@ def build_question_store(
             for turn, text in zip(raw_turns, texts)
         ),
     )
+    typed_fact_count = 0
+    if typed_sidecar:
+        typed_facts = build_typed_facts(raw_turns)
+        write_jsonl(store_dir / "typed_facts.jsonl", typed_facts)
+        typed_fact_count = len(typed_facts)
     stats = {
         "question_id": sample.question_id,
         "num_turns": len(raw_turns),
         "chunk_mode": chunk_mode,
         "embedding_text_mode": embedding_text_mode,
+        "typed_sidecar": typed_sidecar,
+        "typed_fact_count": typed_fact_count,
         "embedder_model": embedder.model_name,
         "build_embedding_input_tokens": batch.input_tokens,
         "build_embedding_provider_tokens": batch.provider_tokens,
@@ -138,3 +153,11 @@ def _check_store_mode(stats: dict[str, Any], chunk_mode: str, embedding_text_mod
             f"{store_dir} was built with embedding_text_mode {built_embedding_text_mode!r}; "
             f"re-run build with --force-rebuild."
         )
+
+
+def _write_typed_facts_for_store(store_dir: Path, stats: dict[str, Any]) -> None:
+    typed_facts = build_typed_facts(read_jsonl(store_dir / "raw_turns.jsonl"))
+    write_jsonl(store_dir / "typed_facts.jsonl", typed_facts)
+    stats["typed_sidecar"] = True
+    stats["typed_fact_count"] = len(typed_facts)
+    write_json(store_dir / "store_stats.json", stats)

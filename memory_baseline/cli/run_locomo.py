@@ -10,6 +10,7 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from queue import Queue
 from typing import Any
 
 import numpy as np
@@ -36,11 +37,21 @@ from memory_baseline.data.locomo import (
 )
 from memory_baseline.generation.answerer import make_answerer
 from memory_baseline.generation.judge import make_judge
+from memory_baseline.generation.provence_pruner import (
+    DEFAULT_PROVENCE_MODEL,
+    ProvenceEvidencePruner,
+    ProvencePruningResult,
+    make_provence_pruner,
+)
 from memory_baseline.indexing.embedder import embed_texts_cached, make_embedder, release_cuda_cache
 from memory_baseline.indexing.vector_store import QuestionStore, embedding_texts_for_turns
 from memory_baseline.retrieval.dense import _dedupe_and_sort_windows, _expand_windows, _filter_indices, _matched_turn, compute_retrieval_metrics
 from memory_baseline.retrieval.formatter import format_evidence_for_answerer
 from memory_baseline.retrieval.ranking import rank_indices
+from memory_baseline.retrieval.typed_facts import build_typed_facts, prepend_typed_fact_pack, select_typed_facts, should_use_typed_facts, source_turn_ids
+
+
+LOCOMO_OVERALL_CATEGORIES = {1, 2, 3, 4}
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -54,7 +65,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--top-k-list")
     parser.add_argument("--message-range", type=int, default=2)
     parser.add_argument("--chunk-mode", choices=["turn"], default="turn")
-    parser.add_argument("--retrieval-method", choices=["dense", "hybrid"], default="dense")
+    parser.add_argument("--retrieval-method", choices=["dense", "hybrid", "semantic_bm25_boost"], default="dense")
     parser.add_argument("--temporal-boost", type=float, default=0.0)
     parser.add_argument("--embedding-model", default=os.getenv("EMBEDDING_MODEL") or os.getenv("EMBEDDER_MODEL") or "local-hash")
     parser.add_argument("--embedding-base-url", default=os.getenv("EMBEDDING_BASE_URL") or os.getenv("EMBEDDER_BASE_URL"))
@@ -73,6 +84,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--force-rebuild", action="store_true")
     parser.add_argument("--skip-existing", action="store_true")
     parser.add_argument("--max-evidence-tokens", type=int)
+    parser.add_argument("--provence-pruning", action="store_true")
+    parser.add_argument("--provence-model", default=DEFAULT_PROVENCE_MODEL)
+    parser.add_argument("--provence-threshold", type=float, default=0.1)
+    parser.add_argument("--provence-batch-size", type=int, default=32)
+    parser.add_argument("--typed-sidecar", action="store_true")
     parser.add_argument("--output-dir", default="runs")
     return parser.parse_args(argv)
 
@@ -222,6 +238,7 @@ def run_build_stage(args: argparse.Namespace, run_dir: Path, records: list[dict[
                     args.force_rebuild,
                     args.skip_existing or args.resume,
                     args.chunk_mode,
+                    args.typed_sidecar,
                 )
             )
         write_jsonl(run_dir / "build_stats.jsonl", stats)
@@ -239,12 +256,19 @@ def build_conversation_store(
     force_rebuild: bool,
     skip_existing: bool,
     chunk_mode: str,
+    typed_sidecar: bool = False,
 ) -> dict[str, Any]:
     store_dir = _store_dir(run_dir, conv_idx)
     stats_path = store_dir / "store_stats.json"
     if (store_dir / "embeddings.npy").exists() and not force_rebuild and stats_path.exists():
         stats = json.loads(stats_path.read_text(encoding="utf-8"))
         _check_chunk_mode(stats, chunk_mode, store_dir)
+        if typed_sidecar and not (store_dir / "typed_facts.jsonl").exists():
+            typed_facts = build_typed_facts(read_jsonl(store_dir / "raw_turns.jsonl"))
+            write_jsonl(store_dir / "typed_facts.jsonl", typed_facts)
+            stats["typed_sidecar"] = True
+            stats["typed_fact_count"] = len(typed_facts)
+            write_json(stats_path, stats)
         return stats
     if store_dir.exists() and force_rebuild:
         shutil.rmtree(store_dir)
@@ -257,11 +281,18 @@ def build_conversation_store(
     np.save(store_dir / "embeddings.npy", batch.vectors)
     write_jsonl(store_dir / "raw_turns.jsonl", raw_turns)
     write_jsonl(store_dir / "embedding_meta.jsonl", ({**turn, "embedding_text": text} for turn, text in zip(raw_turns, texts)))
+    typed_fact_count = 0
+    if typed_sidecar:
+        typed_facts = build_typed_facts(raw_turns)
+        write_jsonl(store_dir / "typed_facts.jsonl", typed_facts)
+        typed_fact_count = len(typed_facts)
     stats = {
         "conversation_id": f"conv{conv_idx}",
         "conversation_idx": conv_idx,
         "num_turns": len(raw_turns),
         "chunk_mode": chunk_mode,
+        "typed_sidecar": typed_sidecar,
+        "typed_fact_count": typed_fact_count,
         "embedder_model": embedder.model_name,
         "build_embedding_input_tokens": batch.input_tokens,
         "build_embedding_provider_tokens": batch.provider_tokens,
@@ -297,6 +328,7 @@ def run_retrieve_stage(
                     args.max_evidence_tokens,
                     args.retrieval_method,
                     args.temporal_boost,
+                    args.typed_sidecar,
                 )
             )
         write_jsonl(run_dir / "retrieval_results.jsonl", results)
@@ -317,6 +349,7 @@ def retrieve_one(
     max_evidence_tokens: int | None,
     retrieval_method: str = "dense",
     temporal_boost: float = 0.0,
+    typed_sidecar: bool = False,
 ) -> dict[str, Any]:
     started = time.monotonic()
     evidence_ids = {str(evidence) for evidence in qa.get("evidence", [])}
@@ -325,6 +358,7 @@ def retrieve_one(
     query = query_batch.vectors[0]
     scores = store.embeddings @ query
     candidate_indices = _filter_indices(store.raw_turns, None, sample.question_date)
+    ranking_diagnostics: dict[str, Any] = {}
     indices, ranked_scores, _bm25_scores = rank_indices(
         query=sample.question,
         dense_scores=scores,
@@ -337,6 +371,7 @@ def retrieve_one(
         question_date=sample.question_date,
         temporal_boost=temporal_boost,
         store=store,
+        ranking_diagnostics=ranking_diagnostics,
     )
     matched_turns = []
     for rank, idx in enumerate(indices, start=1):
@@ -346,9 +381,19 @@ def retrieve_one(
     for window in evidence_windows:
         window["turns"] = [_with_dynamic_labels(dict(turn), evidence_ids, answer_sessions) for turn in window["turns"]]
     deduped_evidence = [_with_dynamic_labels(turn, evidence_ids, answer_sessions) for turn in _dedupe_and_sort_windows(evidence_windows)]
+    typed_facts = []
+    if typed_sidecar and should_use_typed_facts(sample.question, sample.question_type):
+        recalled_ids = {str(turn.get("stable_turn_id")) for turn in deduped_evidence}
+        candidate_facts = [
+            fact
+            for fact in store.typed_facts
+            if recalled_ids & {str(source_id) for source_id in fact.get("source_turn_ids", [])}
+        ]
+        typed_facts = select_typed_facts(sample.question, candidate_facts)
     formatted = format_evidence_for_answerer(deduped_evidence, sample.question_date, max_evidence_tokens)
-    metrics = compute_retrieval_metrics(sample, matched_turns, deduped_evidence, formatted.token_count)
-    return {
+    formatted_text = prepend_typed_fact_pack(formatted.text, typed_facts)
+    metrics = compute_retrieval_metrics(sample, matched_turns, deduped_evidence, estimate_tokens(formatted_text))
+    result = {
         "question_id": sample.question_id,
         "conversation_idx": int(sample.question_id.split("_q", 1)[0].replace("conv", "")),
         "question_type": sample.question_type,
@@ -371,6 +416,10 @@ def retrieve_one(
         "evidence_windows": evidence_windows,
         "deduped_evidence": deduped_evidence,
         "formatted_evidence": formatted.text,
+        "typed_augmented_evidence": formatted_text,
+        "typed_sidecar": typed_sidecar,
+        "typed_facts": typed_facts,
+        "typed_fact_source_turn_ids": sorted(source_turn_ids(typed_facts)),
         "formatted_evidence_turn_ids": formatted.included_turn_ids,
         "evidence_truncated": formatted.truncated,
         "evidence_truncate_strategy": formatted.truncate_strategy,
@@ -378,11 +427,19 @@ def retrieve_one(
         "retrieval_latency_seconds": time.monotonic() - started,
         "metrics": metrics,
     }
+    if ranking_diagnostics:
+        result["ranking_diagnostics"] = ranking_diagnostics
+    return result
 
 
 def run_answer_stage(args: argparse.Namespace, run_dir: Path, qa_items: list[tuple[int, int, dict[str, Any], Any]]) -> list[dict[str, Any]]:
     retrieval_by_id = {row["question_id"]: row for row in read_jsonl(run_dir / "retrieval_results.jsonl")}
     answerer = make_answerer(args.answer_model, args.answer_base_url)
+    workers = args.answer_parallelism if args.answer_parallelism is not None else args.parallelism
+    pruners = _make_provence_pruners(args, max(1, workers)) if args.provence_pruning else None
+    pruner_queue = Queue()
+    for pruner in pruners or []:
+        pruner_queue.put(pruner)
     skip_existing = args.skip_existing or args.resume
     existing = _existing_by_id(run_dir / "answer_logs.jsonl") if skip_existing else {}
     pred_path = run_dir / "predictions.jsonl"
@@ -397,47 +454,83 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, qa_items: list[tup
             log = dict(existing[sample.question_id])
             return {"question_id": sample.question_id, "hypothesis": str(log.get("hypothesis", ""))}, log
         result = retrieval_by_id[sample.question_id]
+        pruner = pruner_queue.get() if pruner_queue.qsize() else None
         try:
-            answer = answerer.answer(sample.question_date, result["formatted_evidence"], sample.question)
+            formatted = _formatted_evidence_for_answer(
+                result,
+                sample,
+                args.max_evidence_tokens,
+                pruner,
+            )
+        finally:
+            if pruner is not None:
+                pruner_queue.put(pruner)
+        pruning = formatted["pruning"]
+        try:
+            answer = answerer.answer(sample.question_date, formatted["text"], sample.question)
         except Exception as exc:
+            query_input_tokens = estimate_tokens(formatted["text"]) + estimate_tokens(sample.question)
             log = {
                 "question_id": sample.question_id,
                 "model": answerer.model_name,
                 "hypothesis": "ERROR: answer generation failed",
                 "error": repr(exc),
-                "latency_seconds": 0.0,
-                "query_input_tokens": estimate_tokens(result["formatted_evidence"]) + estimate_tokens(sample.question),
+                "latency_seconds": pruning.latency_seconds,
+                "query_input_tokens": query_input_tokens,
                 "query_output_tokens": 0,
-                "query_total_tokens": estimate_tokens(result["formatted_evidence"]) + estimate_tokens(sample.question),
+                "query_total_tokens": query_input_tokens,
                 "provider_usage": {},
-                "evidence_ids": result.get("formatted_evidence_turn_ids", []),
+                "evidence_ids": formatted["included_turn_ids"],
                 "top_k": result.get("top_k"),
                 "message_range": result.get("message_range"),
                 "retrieval_method": result.get("retrieval_method"),
                 "temporal_boost": result.get("temporal_boost"),
+                "typed_sidecar": result.get("typed_sidecar", False),
+                "typed_fact_count": len(result.get("typed_facts", [])),
+                "evidence_truncated": formatted["truncated"],
+                "provence_pruning": args.provence_pruning,
+                "provence_model": args.provence_model if args.provence_pruning else None,
+                "provence_threshold": args.provence_threshold if args.provence_pruning else None,
+                "provence_input_tokens": pruning.input_tokens,
+                "provence_output_tokens": pruning.output_tokens,
+                "provence_source_turn_count": pruning.source_turn_count,
+                "provence_kept_turn_count": pruning.kept_turn_count,
+                "provence_compression_rate": pruning.compression_rate,
+                "provence_latency_seconds": pruning.latency_seconds,
             }
             return {"question_id": sample.question_id, "hypothesis": log["hypothesis"]}, log
         log = {
             "question_id": sample.question_id,
             "model": answer.model,
             "hypothesis": answer.hypothesis,
-            "latency_seconds": answer.latency_seconds,
+            "latency_seconds": pruning.latency_seconds + answer.latency_seconds,
             "query_input_tokens": answer.prompt_tokens,
             "query_output_tokens": answer.completion_tokens,
             "query_total_tokens": answer.total_tokens,
             "provider_usage": answer.provider_usage,
-            "evidence_ids": result.get("formatted_evidence_turn_ids", []),
+            "evidence_ids": formatted["included_turn_ids"],
             "top_k": result.get("top_k"),
             "message_range": result.get("message_range"),
             "retrieval_method": result.get("retrieval_method"),
             "temporal_boost": result.get("temporal_boost"),
+            "typed_sidecar": result.get("typed_sidecar", False),
+            "typed_fact_count": len(result.get("typed_facts", [])),
+            "evidence_truncated": formatted["truncated"],
+            "provence_pruning": args.provence_pruning,
+            "provence_model": args.provence_model if args.provence_pruning else None,
+            "provence_threshold": args.provence_threshold if args.provence_pruning else None,
+            "provence_input_tokens": pruning.input_tokens,
+            "provence_output_tokens": pruning.output_tokens,
+            "provence_source_turn_count": pruning.source_turn_count,
+            "provence_kept_turn_count": pruning.kept_turn_count,
+            "provence_compression_rate": pruning.compression_rate,
+            "provence_latency_seconds": pruning.latency_seconds,
         }
         return {"question_id": sample.question_id, "hypothesis": answer.hypothesis}, log
 
     pending_items = [item for item in qa_items if item[3].question_id not in existing]
     predictions = [{"question_id": qid, "hypothesis": str(log.get("hypothesis", ""))} for qid, log in existing.items()]
     logs = list(existing.values())
-    workers = args.answer_parallelism if args.answer_parallelism is not None else args.parallelism
     for prediction, log in _iter_parallel(pending_items, answer_one, workers):
         predictions.append(prediction)
         logs.append(log)
@@ -447,6 +540,43 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, qa_items: list[tup
         write_predictions(pred_path, predictions)
         write_jsonl(log_path, logs)
     return logs
+
+
+def _make_provence_pruners(args: argparse.Namespace, count: int) -> list[ProvenceEvidencePruner]:
+    pruners = [
+        make_provence_pruner(args.provence_model, args.provence_threshold, args.provence_batch_size)
+        for _ in range(count)
+    ]
+    for pruner in pruners:
+        pruner.model
+    return pruners
+
+
+def _formatted_evidence_for_answer(
+    result: dict[str, Any],
+    sample: Any,
+    max_evidence_tokens: int | None,
+    pruner: ProvenceEvidencePruner | None = None,
+) -> dict[str, Any]:
+    pruning = ProvencePruningResult([], 0, 0, 0, 0, 0.0, 0.0)
+    if result.get("deduped_evidence"):
+        evidence_turns = result["deduped_evidence"]
+        if pruner is not None:
+            pruning = pruner.prune_turns(sample.question, evidence_turns)
+            evidence_turns = pruning.turns
+        formatted = format_evidence_for_answerer(evidence_turns, sample.question_date, max_evidence_tokens)
+        return {
+            "text": prepend_typed_fact_pack(formatted.text, result.get("typed_facts", [])),
+            "included_turn_ids": formatted.included_turn_ids,
+            "truncated": formatted.truncated,
+            "pruning": pruning,
+        }
+    return {
+        "text": result.get("typed_augmented_evidence") or result["formatted_evidence"],
+        "included_turn_ids": result.get("formatted_evidence_turn_ids", []),
+        "truncated": result.get("evidence_truncated", False),
+        "pruning": pruning,
+    }
 
 
 def run_judge_stage(args: argparse.Namespace, run_dir: Path, qa_items: list[tuple[int, int, dict[str, Any], Any]]) -> list[dict[str, Any]]:
@@ -533,11 +663,12 @@ def write_metrics(run_dir: Path, categories: list[int]) -> None:
     token_stats = json.loads((run_dir / "token_stats.json").read_text(encoding="utf-8")) if (run_dir / "token_stats.json").exists() else new_token_summary()
     judge_by_id = {row["question_id"]: row for row in judge_logs}
     answer_by_id = {row["question_id"]: row for row in answer_logs}
-    valid = [row for row in retrieval_results if int(row.get("category", 0)) in categories]
+    valid = [row for row in retrieval_results if int(row.get("category", 0)) in LOCOMO_OVERALL_CATEGORIES]
+    breakdown_rows = [row for row in retrieval_results if int(row.get("category", 0)) in categories]
     correct = sum(1 for row in valid if judge_by_id.get(row["question_id"], {}).get("label") == "CORRECT")
     by_type: dict[str, Any] = {}
     for category in categories:
-        rows = [row for row in valid if int(row.get("category", 0)) == category]
+        rows = [row for row in breakdown_rows if int(row.get("category", 0)) == category]
         cat_correct = sum(1 for row in rows if judge_by_id.get(row["question_id"], {}).get("label") == "CORRECT")
         by_type[CATEGORY_NAMES.get(category, str(category))] = {
             "total": len(rows),
@@ -808,6 +939,11 @@ def _config_dict(args: argparse.Namespace, conversations: list[int], categories:
         "cutoff_parallelism": args.cutoff_parallelism,
         "mode": args.mode,
         "max_evidence_tokens": args.max_evidence_tokens,
+        "provence_pruning": args.provence_pruning,
+        "provence_model": args.provence_model,
+        "provence_threshold": args.provence_threshold,
+        "provence_batch_size": args.provence_batch_size,
+        "typed_sidecar": args.typed_sidecar,
         "output_dir": args.output_dir,
         "num_selected_questions": len(qa_items),
     }
@@ -869,10 +1005,13 @@ def _subprocess_args(args: argparse.Namespace, mode: str) -> list[str]:
         ("--judge-parallelism", args.judge_parallelism),
         ("--cutoff-parallelism", args.cutoff_parallelism),
         ("--max-evidence-tokens", args.max_evidence_tokens),
+        ("--provence-model", args.provence_model),
+        ("--provence-threshold", args.provence_threshold),
+        ("--provence-batch-size", args.provence_batch_size),
     ]:
         if value is not None:
             values.extend([option, str(value)])
-    for flag in ["resume", "force_rebuild", "skip_existing"]:
+    for flag in ["resume", "force_rebuild", "skip_existing", "provence_pruning", "typed_sidecar"]:
         if getattr(args, flag):
             values.append("--" + flag.replace("_", "-"))
     return values

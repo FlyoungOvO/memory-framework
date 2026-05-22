@@ -10,6 +10,7 @@ dependencies = [
 
 [project.optional-dependencies]
 hf = [
+  "nltk>=3.8",
   "sentence-transformers>=3.0",
 ]
 

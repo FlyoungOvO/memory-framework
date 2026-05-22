@@ -50,3 +50,23 @@ python -m memory_baseline.cli.run_longmemeval \
 ```
 
 Full answer and judge runs require model endpoints configured in `.env`.
+
+## Provence Pruning
+
+After build/retrieve has produced `retrieval_results.jsonl` for the same run id, run the answer stage without the evidence compiler and prune retrieved turn text with Provence before answer prompting:
+
+```bash
+python -m memory_baseline.cli.run_longmemeval \
+  --data data/longmemeval/longmemeval_s_cleaned.json \
+  --run-id rag_provence_no_compiler \
+  --mode answer \
+  --disable-evidence-compiler \
+  --provence-pruning
+```
+
+Install the HuggingFace extras and the NLTK sentence model first:
+
+```bash
+pip install -e ".[hf]"
+python -c "import nltk; nltk.download('punkt_tab')"
+```

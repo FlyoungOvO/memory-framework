@@ -8,12 +8,14 @@ import numpy as np
 from memory_baseline.generation.answerer import build_answer_messages
 from memory_baseline.generation.evidence_compiler import build_evidence_compiler_messages
 from memory_baseline.generation.judge import LOCOMO_JUDGE_PROMPT
+from memory_baseline.generation.provence_pruner import ProvenceEvidencePruner
 from memory_baseline.cli.run_locomo import _slice_retrieval_result as _slice_locomo_retrieval_result
 from memory_baseline.cli.run_longmemeval import _apply_shard, _slice_retrieval_result as _slice_longmemeval_retrieval_result
 from memory_baseline.cli.merge_longmemeval_metrics import _merge_config
 from memory_baseline.core.llm_cache import cached_response, write_cached_response
 from memory_baseline.retrieval.ranking import BM25Index, keyword_query_terms, rank_indices
 from memory_baseline.retrieval.formatter import format_evidence_for_answerer
+from memory_baseline.retrieval.typed_facts import build_typed_facts, prepend_typed_fact_pack, select_typed_facts, should_use_typed_facts, source_turn_ids
 from memory_baseline.core.io import write_predictions
 from memory_baseline.data.longmemeval import flatten_sample
 from memory_baseline.evaluation.error_analysis import likely_failure_type, write_error_analysis
@@ -21,7 +23,7 @@ from memory_baseline.retrieval.dense import _dedupe_and_sort_windows, _expand_wi
 from memory_baseline.core.schemas import LongMemEvalSample
 from memory_baseline.core.token_accounting import add_build_tokens, add_judge_tokens, add_query_tokens, new_token_summary
 from memory_baseline.core.utils import write_json
-from memory_baseline.indexing.vector_store import embedding_text_for_turn
+from memory_baseline.indexing.vector_store import embedding_text_for_turn, lexical_texts_for_turns
 
 
 def sample() -> LongMemEvalSample:
@@ -150,6 +152,28 @@ def test_multi_session_evidence_includes_count_check():
     assert "<RECALLED_MEMORY>" in formatted.text
 
 
+def test_provence_pruner_replaces_and_drops_turn_content():
+    class FakeProvence:
+        def process(self, question, context, **kwargs):
+            assert question == "Where is the notebook?"
+            assert context == [["The notebook is in the desk. Irrelevant chatter.", "No useful sentence."]]
+            assert kwargs["title"] is None
+            assert kwargs["always_select_title"] is False
+            return {"pruned_context": [["The notebook is in the desk.", ""]]}
+
+    turns = [turn.to_dict() for turn in flatten_sample(sample())[2:4]]
+    turns[0]["content"] = "The notebook is in the desk. Irrelevant chatter."
+    turns[1]["content"] = "No useful sentence."
+    pruner = ProvenceEvidencePruner(model=FakeProvence())
+    result = pruner.prune_turns("Where is the notebook?", turns)
+
+    assert [turn["stable_turn_id"] for turn in result.turns] == [turns[0]["stable_turn_id"]]
+    assert result.turns[0]["content"] == "The notebook is in the desk."
+    assert result.source_turn_count == 2
+    assert result.kept_turn_count == 1
+    assert result.output_tokens < result.input_tokens
+
+
 def test_retrieval_metrics_session_hit():
     s = sample()
     turns = [turn.to_dict() for turn in flatten_sample(s)]
@@ -193,6 +217,170 @@ def test_hybrid_ranker_ignores_zero_bm25_ties():
     assert bm25_scores is not None
     assert not bm25_scores.any()
     assert indices == [1]
+
+
+def test_semantic_bm25_boost_falls_back_to_dense_without_bm25_hits():
+    raw_turns = [turn.to_dict() for turn in flatten_sample(sample())]
+    dense_scores = np.asarray([0.1, 0.9, 0.2, 0.3], dtype=np.float32)
+    diagnostics: dict[str, object] = {}
+    indices, _ranked_scores, bm25_scores = rank_indices(
+        query="zzzz unmatched",
+        dense_scores=dense_scores,
+        raw_turns=raw_turns,
+        retrieval_texts=[turn["content"] for turn in raw_turns],
+        candidate_indices=list(range(len(raw_turns))),
+        top_k=1,
+        retrieval_method="semantic_bm25_boost",
+        ranking_diagnostics=diagnostics,
+    )
+    assert bm25_scores is not None
+    assert not bm25_scores.any()
+    assert indices == [1]
+    assert diagnostics["lexical_rescue_count"] == 0
+
+
+def test_semantic_bm25_boost_promotes_strong_keyword_hit_in_dense_pool():
+    raw_turns = [
+        {"session_date": "2023-05-01", "role": "user"},
+        {"session_date": "2023-05-01", "role": "user"},
+    ]
+    indices, ranked_scores, _ = rank_indices(
+        query="peanut allergy",
+        dense_scores=np.asarray([0.6, 0.59], dtype=np.float32),
+        raw_turns=raw_turns,
+        retrieval_texts=["plain recipe ideas", "peanut allergy warning"],
+        candidate_indices=[0, 1],
+        top_k=2,
+        retrieval_method="semantic_bm25_boost",
+    )
+    assert indices[0] == 1
+    assert ranked_scores[1] > ranked_scores[0]
+
+
+def test_semantic_bm25_boost_limits_lexical_rescue():
+    raw_turns = [{"session_date": "2023-05-01", "role": "user"} for _ in range(100)]
+    dense_scores = np.asarray([1.0 - idx * 0.001 for idx in range(100)], dtype=np.float32)
+    retrieval_texts = ["plain text" for _ in range(100)]
+    for idx in range(90, 100):
+        retrieval_texts[idx] = "rareword"
+    diagnostics: dict[str, object] = {}
+    indices, _ranked_scores, _ = rank_indices(
+        query="rareword",
+        dense_scores=dense_scores,
+        raw_turns=raw_turns,
+        retrieval_texts=retrieval_texts,
+        candidate_indices=list(range(100)),
+        top_k=10,
+        retrieval_method="semantic_bm25_boost",
+        ranking_diagnostics=diagnostics,
+    )
+    rescued = [idx for idx in indices if idx >= 90]
+    assert 0 < len(rescued) <= 2
+    assert diagnostics["lexical_rescue_count"] == 2
+
+
+def test_semantic_bm25_boost_disables_rescue_for_broad_lexical_hits():
+    raw_turns = [{"session_date": "2023-05-01", "role": "user", "speaker": "A"} for _ in range(100)]
+    dense_scores = np.asarray([1.0 - idx * 0.001 for idx in range(100)], dtype=np.float32)
+    diagnostics: dict[str, object] = {}
+    indices, _ranked_scores, _ = rank_indices(
+        query="common",
+        dense_scores=dense_scores,
+        raw_turns=raw_turns,
+        retrieval_texts=["common text" for _ in range(100)],
+        candidate_indices=list(range(100)),
+        top_k=10,
+        retrieval_method="semantic_bm25_boost",
+        ranking_diagnostics=diagnostics,
+    )
+    assert indices == list(range(10))
+    assert diagnostics["lexical_rescue_count"] == 0
+    assert diagnostics["bm25_weight"] == 0.1
+
+
+def test_semantic_bm25_boost_strips_speaker_prefix_from_bm25_text():
+    raw_turns = [{"session_date": "2023-05-01", "role": "user", "speaker": "Caroline"}]
+    _indices, _ranked_scores, bm25_scores = rank_indices(
+        query="Caroline",
+        dense_scores=np.asarray([0.0], dtype=np.float32),
+        raw_turns=raw_turns,
+        retrieval_texts=["Caroline: plain utterance"],
+        candidate_indices=[0],
+        top_k=1,
+        retrieval_method="semantic_bm25_boost",
+    )
+    assert bm25_scores is not None
+    assert bm25_scores[0] == 0
+
+
+def test_semantic_bm25_boost_temporal_boost_requires_current_cue():
+    raw_turns = [
+        {"session_date": "2023/01/01 (Sun) 09:00", "role": "user"},
+        {"session_date": "2023/05/01 (Mon) 09:00", "role": "user"},
+    ]
+    common = {
+        "dense_scores": np.array([0.0, 0.0]),
+        "raw_turns": raw_turns,
+        "retrieval_texts": ["old event", "new event"],
+        "candidate_indices": [0, 1],
+        "top_k": 2,
+        "retrieval_method": "semantic_bm25_boost",
+        "question_type": "temporal-reasoning",
+        "question_date": "2023/06/01 (Thu) 09:00",
+        "temporal_boost": 1.0,
+    }
+    current_indices, _current_scores, _ = rank_indices(query="what is my current status zzzz", **common)
+    relation_indices, _relation_scores, _ = rank_indices(query="when did zzzz happen", **common)
+    assert current_indices[0] == 1
+    assert relation_indices[0] == 0
+
+
+def test_bm25_lexical_text_excludes_metadata_fields():
+    turn = flatten_sample(sample())[0].to_dict()
+    texts = lexical_texts_for_turns([turn])
+    assert texts == [turn["content"]]
+    assert "[date:" not in texts[0]
+    assert "[session:" not in texts[0]
+    assert "[role:" not in texts[0]
+
+
+def test_typed_facts_extract_money_profile_and_source_ids():
+    turns = [turn.to_dict() for turn in flatten_sample(sample())]
+    turns[0]["content"] = "My grandma's 75th birthday was inspiring. I spent $120 at the bike shop."
+    facts = build_typed_facts([turns[0]])
+
+    assert any(fact["fact_type"] == "profile_fact" and fact["value"] == 75 for fact in facts)
+    assert any(fact["fact_type"] == "money_fact" and fact["amount_usd"] == 120 for fact in facts)
+    assert source_turn_ids(facts) == {turns[0]["stable_turn_id"]}
+
+
+def test_select_typed_facts_prefers_query_relevant_fact():
+    turns = [turn.to_dict() for turn in flatten_sample(sample())]
+    turns[0]["content"] = "I spent $120 on a Bell Zephyr bike helmet."
+    turns[1]["content"] = "I loved reading \"Charlotte's Web\" as a kid."
+    facts = build_typed_facts(turns[:2])
+
+    selected = select_typed_facts("How much did I spend on bike expenses?", facts, limit=1)
+    assert selected[0]["fact_type"] == "money_fact"
+    assert "bike helmet" in selected[0]["source_quote"]
+
+
+def test_prepend_typed_fact_pack_keeps_recalled_memory():
+    turns = [turn.to_dict() for turn in flatten_sample(sample())]
+    turns[0]["content"] = "I spent $120 on a Bell Zephyr bike helmet."
+    facts = select_typed_facts("How much did I spend on bike expenses?", build_typed_facts([turns[0]]))
+
+    text = prepend_typed_fact_pack("<RECALLED_MEMORY>x</RECALLED_MEMORY>", facts)
+    assert text.startswith("<TYPED_FACT_MEMORY>")
+    assert "Bell Zephyr" in text
+    assert "<RECALLED_MEMORY>x</RECALLED_MEMORY>" in text
+
+
+def test_typed_fact_routing_is_conservative():
+    assert should_use_typed_facts("Which gift did I buy first?", "temporal-reasoning")
+    assert should_use_typed_facts("How much did I spend on bike expenses?", "multi-session")
+    assert should_use_typed_facts("Where has Melanie camped?", "multi-hop")
+    assert not should_use_typed_facts("What did Caroline do yesterday?", "multi-hop")
 
 
 def test_temporal_boost_prefers_recent_metadata_for_temporal_question():
