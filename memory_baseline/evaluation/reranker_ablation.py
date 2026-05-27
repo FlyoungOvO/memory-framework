@@ -14,7 +14,7 @@ from memory_baseline.core.utils import ensure_dir, estimate_tokens, read_jsonl, 
 from memory_baseline.retrieval.dense import _dedupe_and_sort_windows
 
 
-DEFAULT_RERANKER = "/data/home_new/dfy/.cache/huggingface/hub/models--infgrad--Prism-Qwen3.5-Reranker-0.8B/snapshots/c60729783cb2f0662c0b054a02964402a211e3f4"
+DEFAULT_RERANKER = "infgrad/Prism-Qwen3.5-Reranker-0.8B"
 DEFAULT_ETTIN_RERANKER = "cross-encoder/ettin-reranker-150m-v1"
 
 SYSTEM_PROMPT = "Judge whether the Document meets the requirements based on the Query and the Instruct provided. "
@@ -42,9 +42,6 @@ PROMPT_TEMPLATE = (
 
 def main() -> None:
     args = parse_args()
-    if args.reranker_kind == "prism":
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     if args.model is None:
         args.model = DEFAULT_ETTIN_RERANKER if args.reranker_kind == "cross-encoder" else DEFAULT_RERANKER
     run_dir = Path(args.retrieval_run)
@@ -168,7 +165,7 @@ def load_cross_encoder_reranker(model_path: str, max_length: int, attn_implement
 
 
 def load_prism_reranker(model_path: str) -> tuple[Any, Any, torch.device]:
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
@@ -177,7 +174,6 @@ def load_prism_reranker(model_path: str) -> tuple[Any, Any, torch.device]:
         model_path,
         torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
         trust_remote_code=True,
-        local_files_only=True,
     )
     model.to(device)
     model.eval()
