@@ -115,11 +115,14 @@ class OpenAICompatibleJudge:
             "model": self.model_name,
             "messages": messages,
             "temperature": 0,
-            "max_tokens": 10,
+            "max_tokens": 256,
         }
         cached = cached_response("judge", self.model_name, payload_obj)
         if cached is not None:
-            return _longmemeval_judge_result_from_body(cached, messages, self.model_name, 0.0, cache_hit=True)
+            try:
+                return _longmemeval_judge_result_from_body(cached, messages, self.model_name, 0.0, cache_hit=True)
+            except ValueError:
+                pass
         payload = json.dumps(payload_obj).encode("utf-8")
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -131,7 +134,7 @@ class OpenAICompatibleJudge:
             method="POST",
         )
         started = time.time()
-        body = _open_json_with_retries(request)
+        body = _open_longmemeval_judge_body_with_retries(request)
         latency = time.time() - started
         write_cached_response("judge", self.model_name, payload_obj, body)
         return _longmemeval_judge_result_from_body(body, messages, self.model_name, latency, cache_hit=False)
@@ -205,11 +208,14 @@ def _longmemeval_judge_result_from_body(
     latency_seconds: float,
     cache_hit: bool,
 ) -> JudgeResult:
-    content = body["choices"][0].get("message", {}).get("content", "").strip()
+    content = _longmemeval_judge_response_text(body)
     usage = dict(body.get("usage", {}))
     prompt_tokens = int(usage.get("prompt_tokens") or estimate_messages_tokens(messages))
     completion_tokens = int(usage.get("completion_tokens") or estimate_tokens(content))
-    label = "CORRECT" if "yes" in content.lower() else "WRONG"
+    verdict = _parse_longmemeval_verdict(content)
+    if verdict is None:
+        raise ValueError("LongMemEval judge response did not contain yes/no.")
+    label = "CORRECT" if verdict == "yes" else "WRONG"
     usage["cache_hit"] = cache_hit
     return JudgeResult(
         label=label,
@@ -223,6 +229,32 @@ def _longmemeval_judge_result_from_body(
         model=model_name,
         raw_response=content,
     )
+
+
+def _longmemeval_judge_response_text(body: dict[str, Any]) -> str:
+    message = body["choices"][0].get("message", {})
+    content = str(message.get("content") or "").strip()
+    if content:
+        return content
+    return str(message.get("reasoning_content") or "").strip()
+
+
+def _parse_longmemeval_verdict(text: str) -> str | None:
+    matches = re.findall(r"\b(yes|no)\b", text, flags=re.I)
+    if not matches:
+        return None
+    return matches[-1].lower()
+
+
+def _open_longmemeval_judge_body_with_retries(request: urllib.request.Request) -> dict[str, Any]:
+    last_text = ""
+    for attempt in range(3):
+        body = _open_json_with_retries(request)
+        last_text = _longmemeval_judge_response_text(body)
+        if _parse_longmemeval_verdict(last_text) is not None:
+            return body
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"LongMemEval judge returned no yes/no verdict after retries: {last_text!r}")
 
 
 def _open_json_with_retries(request: urllib.request.Request) -> dict[str, Any]:

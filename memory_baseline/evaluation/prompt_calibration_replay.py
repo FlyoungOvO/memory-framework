@@ -4,6 +4,7 @@ import argparse
 import http.client
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -99,6 +100,30 @@ Question: {question}
 Work through the instructions in <mem_thinking> tags, then give the final answer after "ANSWER:"."""
 
 
+TRUEMEMORY_LME_ANSWER_PROMPT = """You are a memory assistant answering questions about past conversations.
+You have been given retrieved conversation excerpts as context.
+
+INSTRUCTIONS:
+1. Read ALL context carefully; the answer may be spread across multiple excerpts.
+2. Look for specific names, dates, numbers, and details.
+3. Pay attention to who said what. Speaker attribution matters.
+4. For time questions, look for date mentions and temporal references.
+5. If a preference, plan, status, or situation changed over time, give the latest supported information unless the question asks for an earlier state.
+6. If multiple pieces of evidence exist, synthesize them.
+7. For count, list, sum, or comparison questions, consider every relevant excerpt before computing the answer.
+8. Give a concise, specific answer.
+9. If the context genuinely does not contain the answer, say: The information is not available in the recalled memory.
+
+Current date: {question_date}
+
+Context:
+{evidence_text}
+
+Question: {question}
+
+Think step by step, then give the final answer after "ANSWER:"."""
+
+
 STRUCTURED_REASONING_ANSWER_PROMPT = """You answer LongMemEval memory questions using only recalled memory evidence.
 
 The user's question date is {question_date}. Interpret relative time expressions against this date.
@@ -149,6 +174,95 @@ Question: {question}
 Work through the structure, then give the final answer after "ANSWER:"."""
 
 
+MS_EVIDENCE_TABLE_ANSWER_PROMPT = """You answer LongMemEval multi-session memory questions using only recalled memory evidence.
+
+The user's question date is {question_date}. Interpret relative time expressions against this date.
+Each evidence row is a recalled memory turn. Do not use outside knowledge.
+
+Before answering, internally build an operand ledger:
+- identify every row that may contain a candidate item, event, amount, duration, person, place, or status relevant to the question;
+- include only user-specific facts unless the question asks about assistant information;
+- exclude generic assistant advice, examples, hypothetical options, and repeated mentions of the same real-world item/event;
+- for counts/lists, deduplicate by the real-world item or event;
+- for sums/totals, include each distinct supported amount once;
+- use stated approximate values such as about, around, nearly, or over when the question asks for a practical total or difference;
+- for current-state questions, prefer the latest relevant user-stated status.
+
+Do not abstain when the rows contain direct or approximate numbers, dates, prices, durations, or named events needed to answer.
+If the rows genuinely do not contain enough evidence, answer exactly: The information is not available in the recalled memory.
+Return only the final answer after "ANSWER:".
+
+{evidence_text}
+
+Question: {question}
+
+ANSWER:"""
+
+
+GPT41_LEDGER_ANSWER_PROMPT = """You answer LongMemEval memory questions using only recalled memory evidence.
+
+Question date: {question_date}
+Use the question date for relative words in the question. Use each memory row's own date for relative words inside that memory row.
+Use only the recalled memories. Do not use outside knowledge.
+
+Read all recalled memory rows before deciding. The answer may be in a later row or may require combining rows from different sessions.
+
+Build a brief internal ledger:
+1. Identify the answer slot asked by the question, for example who, what, where, when, how many, how much, which item, order, latest/current state, or personalized recommendation.
+2. Scan every memory row and extract only facts that could fill that slot.
+3. For counts, lists, totals, comparisons, or order questions, include every distinct supported item/event/value, remove duplicates, and then compute.
+4. For latest/current/update questions, compare dated evidence and use the latest relevant value unless the question asks for an earlier state.
+5. For preference questions, extract the user's platform, genre, style, constraints, anti-preferences, owned resources, and prior successful choices. Give a personalized answer that respects those facts; do not give generic advice when the memory has a specific preference.
+6. Distinguish user facts and completed actions from assistant examples, generic advice, hypotheticals, and unsupported plans. Use assistant text only when the question asks about assistant information or the assistant is explicitly restating a user-specific fact.
+7. If evidence mentions a related but mismatched entity, place, title, person, or slot, do not answer the mismatched fact.
+
+Final answer rules:
+- Answer the exact slot asked by the question. If the question asks where, give the place; if it asks when, give the time/date; if it asks how many, give the number.
+- Include the complete final count/list/total/order when the question asks for one.
+- If the correct answer is a named entity with an extra location or descriptor, include the main named entity at minimum.
+- If the requested information is genuinely missing or only a mismatched fact is recalled, answer exactly: The information is not available in the recalled memory.
+- Put the final answer after "ANSWER:".
+
+{evidence_text}
+
+Question: {question}
+
+Think briefly using the ledger, then give the final answer after "ANSWER:"."""
+
+
+GPT41_KUMSTR_LEDGER_ANSWER_PROMPT = """You answer LongMemEval memory questions using only recalled memory evidence.
+
+Question date: {question_date}
+Use the question date for relative words in the question. Use each memory row's own date for relative words inside that memory row.
+Use only the recalled memories. Do not use outside knowledge.
+
+Read all recalled memory rows before deciding. The answer may be in a later row or may require combining rows from different sessions.
+
+Before answering, make a compact internal ledger:
+- answer_slot: what exact slot the question asks for, such as who, what, where, when, how many, how much, latest/current value, order, or comparison.
+- candidate_rows: every row that could affect that slot.
+- include: user-specific facts, completed actions, explicit values, and assistant text that restates a user-specific fact.
+- exclude: generic assistant advice, examples, hypotheticals, unrelated entities, and mismatched slots.
+
+Task rules:
+- For counts, lists, sums, totals, or comparisons, enumerate all included candidates from all rows, deduplicate repeated mentions of the same real-world item/event/value, then compute.
+- For temporal/order questions, resolve relative dates against the row date, sort dated facts, and answer the requested order or interval.
+- For latest/current/updated facts, the latest relevant user-stated value wins. A later assistant statement saying it lacks memory does not invalidate a user-stated update in that same row.
+- For direct fact questions, answer the exact slot asked by the question. Do not answer a date when the question asks for a place, or a related item when it asks for a different entity.
+- If evidence is insufficient after scanning all rows, answer exactly: The information is not available in the recalled memory.
+
+Final answer rules:
+- Keep the final answer concise but complete.
+- For lists/counts/totals/orders, include the complete final result.
+- Put the final answer after "ANSWER:".
+
+{evidence_text}
+
+Question: {question}
+
+Work through the ledger, then give the final answer after "ANSWER:"."""
+
+
 def get_calibrated_longmemeval_prompt(task: str, question: str, answer: str, response: str, abstention: bool = False) -> str:
     prompt = get_longmemeval_prompt(task, question, answer, response, abstention=abstention)
     if abstention:
@@ -159,6 +273,33 @@ def get_calibrated_longmemeval_prompt(task: str, question: str, answer: str, res
             "If the correct answer is a named entity with an extra location or descriptive qualifier, and the response contains the main named entity unambiguously, treat it as equivalent and answer yes. If the response only contains a subset of required list, count, or multi-part information, answer no.",
         )
     return prompt
+
+
+def get_gpt41_calibrated_longmemeval_prompt(task: str, question: str, answer: str, response: str, abstention: bool = False) -> str:
+    if abstention:
+        return (
+            "You are judging a LongMemEval response. Return yes or no only.\n\n"
+            "This question is unanswerable from memory. Answer yes if the model clearly says the information is unavailable, incomplete, not mentioned, or explains that only a mismatched related fact was found. Answer no if the model gives a concrete answer to the unanswerable question.\n\n"
+            f"Question: {question}\n\nExplanation: {answer}\n\nModel Response: {response}\n\nIs the model response correct? Answer yes or no only."
+        )
+    if task == "single-session-preference":
+        return (
+            "You are judging a LongMemEval personalized preference answer. Return yes or no only.\n\n"
+            "Answer yes if the response uses the user's core personal preference, constraint, platform, style, anti-preference, or prior interest correctly. It does not need to cover every rubric detail. Answer no if it is generic, contradicts the user's preference, uses the wrong platform/category, or misses the core personalization.\n\n"
+            f"Question: {question}\n\nRubric: {answer}\n\nModel Response: {response}\n\nIs the model response correct? Answer yes or no only."
+        )
+    if task == "temporal-reasoning":
+        extra = " For elapsed-time answers, allow equivalent units and off-by-one day differences."
+    elif task == "knowledge-update":
+        extra = " For updated facts, judge the latest required value as correct even if the response also mentions older values."
+    else:
+        extra = ""
+    return (
+        "You are judging a LongMemEval answer. Return yes or no only.\n\n"
+        "Answer yes if the model response contains the correct answer or a clearly equivalent value. For a named entity with extra location or descriptive qualifiers, the main named entity is enough if it is unambiguous. For direct slot questions, the response must answer the requested slot; for example, a date alone is not correct for a where question. For counts, lists, sums, comparisons, or multi-part answers, a subset is not enough. Do not require exact wording when the meaning is the same."
+        f"{extra}\n\n"
+        f"Question: {question}\n\nCorrect Answer: {answer}\n\nModel Response: {response}\n\nIs the model response correct? Answer yes or no only."
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -178,14 +319,18 @@ def parse_args() -> argparse.Namespace:
         choices=[
             "calibrated_short",
             "mem0_lme",
+            "truememory_lme",
             "global_reasoning",
             "typed_route_mem0_kumstr",
             "structured_reasoning",
             "structured_route_kumstr",
+            "ms_evidence_table",
+            "gpt41_ledger",
+            "gpt41_route_ledger_kumstr",
         ],
         default="calibrated_short",
     )
-    parser.add_argument("--judge-style", choices=["official", "calibrated"], default="official")
+    parser.add_argument("--judge-style", choices=["official", "calibrated", "gpt41_calibrated"], default="official")
     parser.add_argument("--question-ids")
     parser.add_argument("--question-types")
     parser.add_argument("--parallelism", type=int, default=4)
@@ -239,11 +384,14 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Any]
 
     def answer_one(sample: Any) -> tuple[dict[str, str], dict[str, Any]]:
         retrieval = retrieval_by_id[sample.question_id]
-        evidence = format_evidence_for_answerer(
-            retrieval["deduped_evidence"],
-            sample.question_date,
-            question_type=sample.question_type,
-        )
+        if args.answer_style == "ms_evidence_table" and sample.question_type == "multi-session":
+            evidence = format_ms_evidence_table(retrieval["deduped_evidence"], sample.question_date)
+        else:
+            evidence = format_evidence_for_answerer(
+                retrieval["deduped_evidence"],
+                sample.question_date,
+                question_type=sample.question_type,
+            )
         messages = build_answer_messages(args.answer_style, sample.question_date, evidence.text, sample.question, sample.question_type)
         started = time.time()
         body = chat(args.answer_model, args.answer_base_url, os.getenv("ANSWER_API_KEY") or os.getenv("ANSWERER_API_KEY") or os.getenv("OPENAI_API_KEY"), messages, f"answer_prompt_{args.answer_style}")
@@ -291,6 +439,19 @@ def run_answer_stage(args: argparse.Namespace, run_dir: Path, samples: list[Any]
 
 
 def build_answer_messages(answer_style: str, question_date: str, evidence_text: str, question: str, question_type: str) -> list[dict[str, str]]:
+    if answer_style == "ms_evidence_table":
+        if question_type == "multi-session":
+            prompt = MS_EVIDENCE_TABLE_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
+            return [{"role": "user", "content": prompt}]
+        return build_baseline_answer_messages(question_date, evidence_text, question, question_type)
+    if answer_style == "gpt41_ledger":
+        prompt = GPT41_LEDGER_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
+        return [{"role": "user", "content": prompt}]
+    if answer_style == "gpt41_route_ledger_kumstr":
+        if question_type in {"knowledge-update", "multi-session", "temporal-reasoning"}:
+            prompt = GPT41_KUMSTR_LEDGER_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
+            return [{"role": "user", "content": prompt}]
+        return build_baseline_answer_messages(question_date, evidence_text, question, question_type)
     if answer_style == "structured_route_kumstr":
         if question_type in {"knowledge-update", "multi-session", "temporal-reasoning"}:
             prompt = STRUCTURED_REASONING_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
@@ -303,6 +464,9 @@ def build_answer_messages(answer_style: str, question_date: str, evidence_text: 
         return build_baseline_answer_messages(question_date, evidence_text, question, question_type)
     if answer_style == "structured_reasoning":
         prompt = STRUCTURED_REASONING_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
+        return [{"role": "user", "content": prompt}]
+    if answer_style == "truememory_lme":
+        prompt = TRUEMEMORY_LME_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
         return [{"role": "user", "content": prompt}]
     if answer_style == "mem0_lme":
         prompt = MEM0_LME_ANSWER_PROMPT.format(question_date=question_date, evidence_text=evidence_text, question=question)
@@ -326,9 +490,60 @@ def build_answer_messages(answer_style: str, question_date: str, evidence_text: 
 
 
 def final_answer(answer_style: str, text: str) -> str:
-    if answer_style in {"mem0_lme", "global_reasoning", "typed_route_mem0_kumstr", "structured_reasoning", "structured_route_kumstr"} and "ANSWER:" in text:
+    if answer_style in {"mem0_lme", "truememory_lme", "global_reasoning", "typed_route_mem0_kumstr", "structured_reasoning", "structured_route_kumstr", "ms_evidence_table", "gpt41_ledger", "gpt41_route_ledger_kumstr"} and "ANSWER:" in text:
         return text.rsplit("ANSWER:", 1)[1].strip()
     return text
+
+
+def format_ms_evidence_table(turns: list[dict[str, Any]], question_date: str) -> Any:
+    sorted_turns = sorted(
+        turns,
+        key=lambda turn: (
+            str(turn.get("session_date", "")),
+            int(turn.get("session_idx", 0)),
+            int(turn.get("turn_idx", 0)),
+        ),
+    )
+    lines = [
+        "<MS_EVIDENCE_ROWS>",
+        "Rows are recalled historical conversation turns from previous, separate sessions. Treat each row as evidence, not as a final operand.",
+        f"Question date: {question_date}",
+    ]
+    included_turn_ids = []
+    for idx, turn in enumerate(sorted_turns, 1):
+        included_turn_ids.append(turn["stable_turn_id"])
+        lines.extend(
+            [
+                f"[R{idx:02d}]",
+                f"date: {escape_table_cell(turn.get('session_date', ''))}",
+                f"session: {escape_table_cell(turn.get('session_id', ''))}",
+                f"role: {escape_table_cell(turn.get('role', ''))}",
+                f"evidence: {clip_cell(turn.get('content', ''))}",
+                "",
+            ]
+        )
+    lines.append("</MS_EVIDENCE_ROWS>")
+    text = "\n".join(lines)
+    return type(
+        "EvidenceTable",
+        (),
+        {
+            "text": text,
+            "included_turn_ids": included_turn_ids,
+            "truncated": False,
+        },
+    )()
+
+
+def escape_table_cell(value: Any) -> str:
+    return " ".join(str(value).replace("|", "/").split())
+
+
+def clip_cell(value: Any, limit: int = 1200) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
 
 
 def parse_question_types(value: str | None) -> set[str] | None:
@@ -352,17 +567,18 @@ def run_judge_stage(args: argparse.Namespace, run_dir: Path, samples: list[Any])
         response = pred_by_id[sample.question_id]
         if args.judge_style == "official":
             prompt = get_longmemeval_prompt(sample.question_type, sample.question, sample.answer, response, abstention=is_abstention_sample(sample))
-        else:
+        elif args.judge_style == "calibrated":
             prompt = get_calibrated_longmemeval_prompt(sample.question_type, sample.question, sample.answer, response, abstention=is_abstention_sample(sample))
+        else:
+            prompt = get_gpt41_calibrated_longmemeval_prompt(sample.question_type, sample.question, sample.answer, response, abstention=is_abstention_sample(sample))
         messages = [{"role": "user", "content": prompt}]
         started = time.time()
-        body = chat(args.judge_model, args.judge_base_url, os.getenv("JUDGE_API_KEY") or os.getenv("OPENAI_API_KEY"), messages, f"judge_{args.judge_style}", max_tokens=10)
+        body, content, verdict = chat_judge(args.judge_model, args.judge_base_url, os.getenv("JUDGE_API_KEY") or os.getenv("OPENAI_API_KEY"), messages, f"judge_{args.judge_style}")
         latency = time.time() - started
-        content = body["choices"][0].get("message", {}).get("content", "").strip()
         usage = dict(body.get("usage", {}))
         prompt_tokens = int(usage.get("prompt_tokens") or estimate_messages_tokens(messages))
         completion_tokens = int(usage.get("completion_tokens") or estimate_tokens(content))
-        label = "CORRECT" if "yes" in content.lower() else "WRONG"
+        label = "CORRECT" if verdict == "yes" else "WRONG"
         row = {
             "question_id": sample.question_id,
             "question_type": sample.question_type,
@@ -393,15 +609,44 @@ def run_judge_stage(args: argparse.Namespace, run_dir: Path, samples: list[Any])
     return [logs_by_id[sample.question_id] for sample in samples if sample.question_id in logs_by_id]
 
 
-def chat(model: str, base_url: str | None, api_key: str | None, messages: list[dict[str, str]], cache_kind: str, max_tokens: int | None = None) -> dict[str, Any]:
+def chat_judge(model: str, base_url: str | None, api_key: str | None, messages: list[dict[str, str]], cache_kind: str) -> tuple[dict[str, Any], str, str]:
+    last_content = ""
+    for attempt in range(3):
+        body = chat(model, base_url, api_key, messages, cache_kind, max_tokens=256, skip_cache=attempt > 0)
+        content = judge_response_text(body)
+        verdict = parse_yes_no_verdict(content)
+        if verdict is not None:
+            return body, content, verdict
+        last_content = content
+        time.sleep(2 * (attempt + 1))
+    raise RuntimeError(f"Judge response did not contain yes/no after retries: {last_content!r}")
+
+
+def judge_response_text(body: dict[str, Any]) -> str:
+    message = body["choices"][0].get("message", {})
+    content = str(message.get("content") or "").strip()
+    if content:
+        return content
+    return str(message.get("reasoning_content") or "").strip()
+
+
+def parse_yes_no_verdict(text: str) -> str | None:
+    matches = re.findall(r"\b(yes|no)\b", text, flags=re.I)
+    if not matches:
+        return None
+    return matches[-1].lower()
+
+
+def chat(model: str, base_url: str | None, api_key: str | None, messages: list[dict[str, str]], cache_kind: str, max_tokens: int | None = None, skip_cache: bool = False) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY-compatible key is required.")
     payload_obj: dict[str, Any] = {"model": model, "messages": messages, "temperature": 0}
     if max_tokens is not None:
         payload_obj["max_tokens"] = max_tokens
-    cached = cached_response(cache_kind, model, payload_obj)
-    if cached is not None:
-        return cached
+    if not skip_cache:
+        cached = cached_response(cache_kind, model, payload_obj)
+        if cached is not None:
+            return cached
     payload = json.dumps(payload_obj).encode("utf-8")
     request = urllib.request.Request(
         f"{(base_url or os.getenv('OPENAI_BASE_URL') or 'https://api.openai.com/v1').rstrip('/')}/chat/completions",
